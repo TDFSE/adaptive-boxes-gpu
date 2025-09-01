@@ -2,4 +2,5 @@
 adabox
 results/
 third_party/
-perf_testing/*
+perf_testing/
+docs/

@@ -4,6 +4,8 @@
 #include "./getters.h"
 // random
 #include "./random_generator.h"
+// partition graph
+#include "./partition_graph.h"
 
 // getters
 using namespace ng;
@@ -25,7 +27,8 @@ using namespace ng;
     Each block has a largest rectangle that could find, in order to get the largest Rectangle, then compute the area and
     stores in areas variable.
  */
-__global__ void find_largest_rectangle(curandState *state, long m, long n, int *data_matrix, int *out, int *areas){
+__global__ void find_largest_rectangle(curandState *state, long m, long n, int *data_matrix, int *out, int *areas, 
+                                       partition_t* partitions, int partition_count){
 
 
 	const int coords_m = 5;
@@ -47,7 +50,8 @@ __global__ void find_largest_rectangle(curandState *state, long m, long n, int *
 	int b_n = gridDim.x;
 	
 	
-	/* GET RANDOM POINT: the value of that random point in the matrix must be one(1)
+	/* GET PRIORITY-GUIDED POINT: Select point from high-priority partition
+	 * Each thread gets a different high-priority partition to avoid clustering
 	 */
 	if(j==0){
 	        areas[b_i*b_n + b_j] = 0;
@@ -57,21 +61,63 @@ __global__ void find_largest_rectangle(curandState *state, long m, long n, int *
 		
 		unsigned int xx;
 		unsigned int yy;
-		for(int g=0; g<100; g++){
-			xx = curand(&localState);
-			yy = curand(&localState);
-		 	idx_i = abs((int)xx)%(m);	
-			idx_j = abs((int)yy)%(n);
-			if (data_matrix[idx_i*n + idx_j]==1){
-				is_sleeping = false;
-				break;
-			}else{
-				is_sleeping = true;
+		
+		// Priority-guided selection: each thread gets different high-priority partition
+		bool found_in_partition = false;
+		if (partitions != NULL && partition_count > 0) {
+			int thread_id = b_i * gridDim.x + b_j; // Unique thread identifier
+			int partition_id = get_priority_guided_partition(partitions, partition_count, thread_id);
+			
+			// Bounds check partition_id
+			if (partition_id >= 0 && partition_id < partition_count) {
+				partition_t current_partition = partitions[partition_id];
+				
+				// Validate partition boundaries
+				if (current_partition.x_start >= 0 && current_partition.x_end < n && 
+				    current_partition.y_start >= 0 && current_partition.y_end < m &&
+				    current_partition.x_end >= current_partition.x_start &&
+				    current_partition.y_end >= current_partition.y_start) {
+					
+					// Sample within high-priority partition
+					for(int g=0; g<50; g++){
+						xx = curand(&localState);
+						yy = curand(&localState);
+						
+						int partition_width = current_partition.x_end - current_partition.x_start + 1;
+						int partition_height = current_partition.y_end - current_partition.y_start + 1;
+						
+						idx_j = current_partition.x_start + (abs((int)xx) % partition_width);
+						idx_i = current_partition.y_start + (abs((int)yy) % partition_height);
+						
+						if (data_matrix[idx_i*n + idx_j]==1){
+							is_sleeping = false;
+							found_in_partition = true;
+							break;
+						}
+					}
+				}
 			}
 		}
+		
+		// Fallback to full matrix search if partition guidance failed
+		if (!found_in_partition) {
+			for(int g=0; g<100; g++){
+				xx = curand(&localState);
+				yy = curand(&localState);
+				idx_i = abs((int)xx)%(m);	
+				idx_j = abs((int)yy)%(n);
+				if (data_matrix[idx_i*n + idx_j]==1){
+					is_sleeping = false;
+					break;
+				}else{
+					is_sleeping = true;
+				}
+			}
+		}
+		
 		state[id] = localState;
 
-		//printf("idx_i %d  idx_j %d \n",idx_i,idx_j);
+		//printf("priority_guided: thread_id=%d, found_in_partition=%d, idx_i=%d, idx_j=%d\n", b_i*gridDim.x+b_j, found_in_partition, idx_i, idx_j);
 	}
 	__syncthreads();
 	

@@ -19,6 +19,9 @@
 // csv
 #include "./include/csv_tools.h"
 #include "./include/io_tools.h"
+// partition system
+#include "./include/partition_graph.h"
+#include "./include/partition_kernels.h"
 
 
 int main(int argc, char *argv[]){
@@ -93,6 +96,40 @@ int main(int argc, char *argv[]){
 	setup_kernel<<<grid, block>>>(devStates);
 	cudaDeviceSynchronize();
 
+	// Partition system initialization
+	const int partition_size = 32;  // Default 32x32 tiles
+	const float density_threshold = 0.1f;  // 10% filled pixels threshold
+	
+	int partition_count = calculate_partition_count(m, n, partition_size);
+	printf("Initializing partition system: %d partitions of size %dx%d\n", partition_count, partition_size, partition_size);
+	
+	// Allocate partition device memory
+	partition_t *partitions_d;
+	int *adjacency_matrix_d;
+	CC(cudaMalloc((void**)&partitions_d, partition_count * sizeof(partition_t)));
+	CC(cudaMalloc((void**)&adjacency_matrix_d, partition_count * partition_count * sizeof(int)));
+	
+	// Initialize partitions with zero values
+	CC(cudaMemset(partitions_d, 0, partition_count * sizeof(partition_t)));
+	CC(cudaMemset(adjacency_matrix_d, 0, partition_count * partition_count * sizeof(int)));
+	
+	// Setup partition kernels grid/block dimensions
+	dim3 partition_grid(partition_count, 1, 1);
+	dim3 partition_block(min(256, partition_size * partition_size), 1, 1);  // Max 256 threads per block
+	
+	dim3 connectivity_grid((partition_count + 255) / 256, 1, 1);
+	dim3 connectivity_block(256, 1, 1);
+	
+	// Calculate initial density and connectivity
+	compute_partition_density<<<partition_grid, partition_block>>>(data_d, m, n, partitions_d, partition_count, partition_size);
+	cudaDeviceSynchronize();
+	
+	build_connectivity_graph<<<connectivity_grid, connectivity_block>>>(partitions_d, partition_count, adjacency_matrix_d, density_threshold, partition_size, n);
+	cudaDeviceSynchronize();
+	
+	update_partition_priorities<<<connectivity_grid, connectivity_block>>>(partitions_d, partition_count, adjacency_matrix_d);
+	cudaDeviceSynchronize();
+
 	// Loop
 	printf("Working...\n");
 	rectangle_t rec;
@@ -110,7 +147,7 @@ int main(int argc, char *argv[]){
 	int x1,x2,y1,y2;
 
 	for (int step=0; step<max_step; step++){
-		find_largest_rectangle<<<grid,block>>>(devStates,m,n,data_d,out_d, areas_d);
+		find_largest_rectangle<<<grid,block>>>(devStates,m,n,data_d,out_d, areas_d, partitions_d, partition_count);
 		cudaDeviceSynchronize();
 		
 		thrust::device_vector<int>::iterator iter = thrust::max_element(t_areas_d.begin(), t_areas_d.end());
@@ -149,9 +186,21 @@ int main(int argc, char *argv[]){
 				recs.push_back(rec);
 			}
 			
+			last_sum = sum;
+			
+			// Update partitions every 10th rectangle removal (reduces overhead while maintaining guidance)
+			if (step % 10 == 0) {
+				// Update affected partitions after rectangle removal
+				update_affected_partitions<<<partition_grid, partition_block>>>(x1, x2, y1, y2, partitions_d, partition_count, data_d, m, n, partition_size);
+				cudaDeviceSynchronize();
+				
+				// Recompute priorities for updated partitions
+				update_partition_priorities<<<connectivity_grid, connectivity_block>>>(partitions_d, partition_count, adjacency_matrix_d);
+				cudaDeviceSynchronize();
+			}
+			
 			/*printf("sum = %d\n", sum);			*/
 
-			last_sum = sum;
 			if(sum<=0){
 				break;
 			}
@@ -178,6 +227,8 @@ int main(int argc, char *argv[]){
 	
 	// Free memory
 	cudaFree(devStates);
+	cudaFree(partitions_d);
+	cudaFree(adjacency_matrix_d);
 	/*delete data;*/
 
 	return 0;
