@@ -100,35 +100,48 @@ int main(int argc, char *argv[]){
 	const int partition_size = 32;  // Default 32x32 tiles
 	const float density_threshold = 0.1f;  // 10% filled pixels threshold
 	
-	int partition_count = calculate_partition_count(m, n, partition_size);
-	printf("Initializing partition system: %d partitions of size %dx%d\n", partition_count, partition_size, partition_size);
+	// Adaptive partitioning threshold - only use partitions for large matrices
+	// Eliminates overhead for small datasets while preserving gains for large ones
+	bool use_partitions = (m * n > 500000);  // ~707x707 threshold
 	
-	// Allocate partition device memory
-	partition_t *partitions_d;
-	int *adjacency_matrix_d;
-	CC(cudaMalloc((void**)&partitions_d, partition_count * sizeof(partition_t)));
-	CC(cudaMalloc((void**)&adjacency_matrix_d, partition_count * partition_count * sizeof(int)));
+	partition_t *partitions_d = nullptr;
+	int *adjacency_matrix_d = nullptr;
+	int partition_count = 0;
 	
-	// Initialize partitions with zero values
-	CC(cudaMemset(partitions_d, 0, partition_count * sizeof(partition_t)));
-	CC(cudaMemset(adjacency_matrix_d, 0, partition_count * partition_count * sizeof(int)));
+	// Setup partition kernels grid/block dimensions (declared here for use in main loop)
+	dim3 partition_grid, partition_block, connectivity_grid, connectivity_block;
 	
-	// Setup partition kernels grid/block dimensions
-	dim3 partition_grid(partition_count, 1, 1);
-	dim3 partition_block(min(256, partition_size * partition_size), 1, 1);  // Max 256 threads per block
-	
-	dim3 connectivity_grid((partition_count + 255) / 256, 1, 1);
-	dim3 connectivity_block(256, 1, 1);
-	
-	// Calculate initial density and connectivity
-	compute_partition_density<<<partition_grid, partition_block>>>(data_d, m, n, partitions_d, partition_count, partition_size);
-	cudaDeviceSynchronize();
-	
-	build_connectivity_graph<<<connectivity_grid, connectivity_block>>>(partitions_d, partition_count, adjacency_matrix_d, density_threshold, partition_size, n);
-	cudaDeviceSynchronize();
-	
-	update_partition_priorities<<<connectivity_grid, connectivity_block>>>(partitions_d, partition_count, adjacency_matrix_d);
-	cudaDeviceSynchronize();
+	if (use_partitions) {
+		partition_count = calculate_partition_count(m, n, partition_size);
+		printf("Initializing partition system: %d partitions of size %dx%d\n", partition_count, partition_size, partition_size);
+		
+		// Allocate partition device memory
+		CC(cudaMalloc((void**)&partitions_d, partition_count * sizeof(partition_t)));
+		CC(cudaMalloc((void**)&adjacency_matrix_d, partition_count * partition_count * sizeof(int)));
+		
+		// Initialize partitions with zero values
+		CC(cudaMemset(partitions_d, 0, partition_count * sizeof(partition_t)));
+		CC(cudaMemset(adjacency_matrix_d, 0, partition_count * partition_count * sizeof(int)));
+		
+		// Configure partition kernels grid/block dimensions
+		partition_grid = dim3(partition_count, 1, 1);
+		partition_block = dim3(min(256, partition_size * partition_size), 1, 1);  // Max 256 threads per block
+		
+		connectivity_grid = dim3((partition_count + 255) / 256, 1, 1);
+		connectivity_block = dim3(256, 1, 1);
+		
+		// Calculate initial density and connectivity
+		compute_partition_density<<<partition_grid, partition_block>>>(data_d, m, n, partitions_d, partition_count, partition_size);
+		cudaDeviceSynchronize();
+		
+		build_connectivity_graph<<<connectivity_grid, connectivity_block>>>(partitions_d, partition_count, adjacency_matrix_d, density_threshold, partition_size, n);
+		cudaDeviceSynchronize();
+		
+		update_partition_priorities<<<connectivity_grid, connectivity_block>>>(partitions_d, partition_count, adjacency_matrix_d);
+		cudaDeviceSynchronize();
+	} else {
+		printf("Using original random exploration (matrix size %ldx%ld below threshold)\n", m, n);
+	}
 
 	// Loop
 	printf("Working...\n");
@@ -188,8 +201,8 @@ int main(int argc, char *argv[]){
 			
 			last_sum = sum;
 			
-			// Update partitions every 10th rectangle removal (reduces overhead while maintaining guidance)
-			if (step % 10 == 0) {
+			// Update partitions every 10th rectangle removal (only if using partitions)
+			if (use_partitions && step % 10 == 0) {
 				// Update affected partitions after rectangle removal
 				update_affected_partitions<<<partition_grid, partition_block>>>(x1, x2, y1, y2, partitions_d, partition_count, data_d, m, n, partition_size);
 				cudaDeviceSynchronize();
